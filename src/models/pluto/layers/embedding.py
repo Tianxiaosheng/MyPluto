@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from natten import NeighborhoodAttention1D
 from timm.models.layers import DropPath
 
-
+# 邻居注意力序列编码器
 class NATSequenceEncoder(nn.Module):
     def __init__(
         self,
@@ -61,19 +61,25 @@ class NATSequenceEncoder(nn.Module):
 
     def forward(self, x):
         """x: [B, C, T]"""
+        # 将输入数据通过卷积嵌入层进行嵌入,输入特征->潜入特征
+        # [B, C, T] -> [B, T, embed_dim]
         x = self.embed(x)
-
+        # 将嵌入后的数据通过多个NAT层进行多层级特征提取
         out = []
         for idx, level in enumerate(self.levels):
+            # x: 下采样后的特征（时间减半，维度翻倍）
+            # xo: 当前层的特征(时间不变，维度不变，用于FPN)
             x, xo = level(x)
             if idx in self.out_indices:
                 norm_layer = getattr(self, f"norm{idx}")
                 x_out = norm_layer(xo)
                 out.append(x_out.permute(0, 2, 1).contiguous())
 
+        # 将多层特征统一到相同维度
         laterals = [
             lateral_conv(out[i]) for i, lateral_conv in enumerate(self.lateral_convs)
         ]
+        # 将多层特征进行上采样和融合
         for i in range(len(out) - 1, 0, -1):
             laterals[i - 1] = laterals[i - 1] + F.interpolate(
                 laterals[i],
@@ -82,8 +88,9 @@ class NATSequenceEncoder(nn.Module):
                 align_corners=False,
             )
 
+        # 将多层特征进行卷积融合，输出：[B, 128, T]
         out = self.fpn_conv(laterals[0])
-
+        # 取最后一个时间步的特征，输出：[B, 128]
         return out[:, :, -1]
 
 

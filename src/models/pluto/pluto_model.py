@@ -61,6 +61,7 @@ class PlanningModel(TorchModuleWrapper):
         self.radius = feature_builder.radius
         self.ref_free_traj = ref_free_traj
 
+        # 位置嵌入，[输入维度，输出维度，频率带宽]
         self.pos_emb = FourierEmbedding(3, dim, 64)
 
         self.agent_encoder = AgentEncoder(
@@ -125,50 +126,74 @@ class PlanningModel(TorchModuleWrapper):
             nn.init.normal_(m.weight, mean=0.0, std=0.02)
 
     def forward(self, data):
+        # 原始数据，包括所有agent(ego和周边agent)和地图信息
         agent_pos = data["agent"]["position"][:, :, self.history_steps - 1]
         agent_heading = data["agent"]["heading"][:, :, self.history_steps - 1]
         agent_mask = data["agent"]["valid_mask"][:, :, : self.history_steps]
         polygon_center = data["map"]["polygon_center"]
         polygon_mask = data["map"]["valid_mask"]
 
+        # 获取batch_size和agent数量[4, 49]
         bs, A = agent_pos.shape[0:2]
 
+        # 将agent位置和地图中心位置拼接在一起[4, 198, 2]
         position = torch.cat([agent_pos, polygon_center[..., :2]], dim=1)
+        # 将agent航向和地图中心航向拼接在一起[4, 198]
         angle = torch.cat([agent_heading, polygon_center[..., 2]], dim=1)
         angle = (angle + math.pi) % (2 * math.pi) - math.pi
+        # 将agent和地图的位置和航向拼接在一起[4, 198, 3]
         pos = torch.cat([position, angle.unsqueeze(-1)], dim=-1)
 
+        # 创建agent和地图的掩码
         agent_key_padding = ~(agent_mask.any(-1))
         polygon_key_padding = ~(polygon_mask.any(-1))
+        # 将agent和地图的掩码拼接在一起
         key_padding_mask = torch.cat([agent_key_padding, polygon_key_padding], dim=-1)
+        # -------以上拼接数据不用于encoder(这个阶段说的encoder其实是embedder)-------
 
+        # 获得agent的嵌入embedder[4, 49, 128]
         x_agent = self.agent_encoder(data)
+        # 获得地图的embedder[4, 149, 128]
         x_polygon = self.map_encoder(data)
+        # 获得静态物体的embedder x_static[4, 17, 128]
         x_static, static_pos, static_key_padding = self.static_objects_encoder(data)
 
+        # 拼接agent、地图和静态物体的编码，得到最终的embedder [4, 215, 128]
         x = torch.cat([x_agent, x_polygon, x_static], dim=1)
 
+        # 拼接agent和地图的位置和静态物体的位置，得到最终的位置[4, 215, 3]
         pos = torch.cat([pos, static_pos], dim=1)
+        # 将位置[4, 215, 3]进行傅里叶嵌入， 得到[4, 215, 128]
         pos_embed = self.pos_emb(pos)
 
+        # 将agent和地图的掩码拼接在一起
         key_padding_mask = torch.cat([key_padding_mask, static_key_padding], dim=-1)
+        # 将位置嵌入和编码拼接在一起
         x = x + pos_embed
 
+        # 将经过位置嵌入和编码拼接在一起的数据通过transformer encoder进行编码
         for blk in self.encoder_blocks:
             x = blk(x, key_padding_mask=key_padding_mask, return_attn_weights=False)
+        # 对编码进行层归一化
         x = self.norm(x)
 
+        # 将经过transformer encoder编码的数据通过agent预测器进行预测
+        # 只对障碍物进行预测，不包括ego，其实这里的agent预测器就是decoder
+        # 预测模型结构为MLP，输入为编码，输出为预测结果（cursor预测的结果）
         prediction = self.agent_predictor(x[:, 1:A])
 
+        # 判断是否存在参考线
         ref_line_available = data["reference_line"]["position"].shape[1] > 0
 
+        # 如果存在参考线，则通过planning decoder进行预测
         if ref_line_available:
             trajectory, probability = self.planning_decoder(
                 data, {"enc_emb": x, "enc_key_padding_mask": key_padding_mask}
             )
+        # 如果不存在参考线，则不进行预测
         else:
             trajectory, probability = None, None
-
+        # import pdb; pdb.set_trace()
         out = {
             "trajectory": trajectory,
             "probability": probability,  # (bs, R, M)

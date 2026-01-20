@@ -54,6 +54,7 @@ class AgentEncoder(nn.Module):
     def forward(self, data):
         T = self.hist_steps
 
+        # [4, 49, 21, 2]
         position = data["agent"]["position"][:, :, :T]
         heading = data["agent"]["heading"][:, :, :T]
         velocity = data["agent"]["velocity"][:, :, :T]
@@ -61,6 +62,7 @@ class AgentEncoder(nn.Module):
         category = data["agent"]["category"].long()
         valid_mask = data["agent"]["valid_mask"][:, :, :T]
 
+        # [4, 49, 21] -> [4, 49, 20]
         heading_vec = self.to_vector(heading, valid_mask)
         valid_mask_vec = valid_mask[..., 1:] & valid_mask[..., :-1]
         agent_feature = torch.cat(
@@ -73,19 +75,22 @@ class AgentEncoder(nn.Module):
             ],
             dim=-1,
         )
+        # [4, 49, 20, 9]
         bs, A, T, _ = agent_feature.shape
         agent_feature = agent_feature.view(bs * A, T, -1)
         valid_agent_mask = valid_mask.any(-1).flatten()
-
+        # [74, 128]
         x_agent_tmp = self.history_encoder(
             agent_feature[valid_agent_mask].permute(0, 2, 1).contiguous()
         )
         x_agent = torch.zeros(bs * A, self.dim, device=position.device)
         x_agent[valid_agent_mask] = x_agent_tmp
+        # [4, 49, 128]
         x_agent = x_agent.view(bs, A, self.dim)
 
         if not self.use_ego_history:
             ego_feature = data["current_state"][:, : self.state_channel]
+
             x_ego = self.ego_state_emb(ego_feature)
             x_agent[:, 0] = x_ego
 

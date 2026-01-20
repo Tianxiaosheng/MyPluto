@@ -24,6 +24,9 @@ class FourierEmbedding(nn.Module):
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
 
+        # 创建[input_dim:3, num_freq_bands:64]的可学习频率参数
+        # 注意：与传统固定频率序列（base_freq * 2^i * 2*pi）不同，
+        # 这里使用可学习的 Embedding，允许模型自适应学习最优频率模式
         self.freqs = nn.Embedding(input_dim, num_freq_bands) if input_dim != 0 else None
         self.mlps = nn.ModuleList(
             [
@@ -46,10 +49,17 @@ class FourierEmbedding(nn.Module):
         self,
         continuous_inputs: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        # [4, 215, 3, 64] = [4, 215, 3, 1] * [3, 64]
+        # 使用可学习的频率权重（而非传统的固定 2^i 指数序列）
         x = continuous_inputs.unsqueeze(-1) * self.freqs.weight * 2 * math.pi
+
+        # [4， 215， 3， 64+64+1]
         x = torch.cat([x.cos(), x.sin(), continuous_inputs.unsqueeze(-1)], dim=-1)
         continuous_embs: List[Optional[torch.Tensor]] = [None] * self.input_dim
         for i in range(self.input_dim):
+            # [B, T, hidden_dim] = [B, T, 2 * num_freq_bands + 1] * [num_freq_bands + 1, hidden_dim]
             continuous_embs[i] = self.mlps[i](x[..., i, :])
+        # [4, 215, 128]
         x = torch.stack(continuous_embs).sum(dim=0)
+        # import pdb; pdb.set_trace()
         return self.to_out(x)
