@@ -14,16 +14,20 @@ class DecoderLayer(nn.Module):
         super().__init__()
         self.dim = dim
 
+        # reference line to reference line attention
         self.r2r_attn = nn.MultiheadAttention(
             dim, num_heads, dropout=dropout, batch_first=True
         )
+        # mode to mode attention
         self.m2m_attn = nn.MultiheadAttention(
             dim, num_heads, dropout=dropout, batch_first=True
         )
+        # query与encoder的交互
         self.cross_attn = nn.MultiheadAttention(
             dim, num_heads, dropout=dropout, batch_first=True
         )
 
+        # feed forward network
         self.ffn = nn.Sequential(
             nn.Linear(dim, dim * mlp_ratio),
             nn.ReLU(inplace=True),
@@ -31,6 +35,7 @@ class DecoderLayer(nn.Module):
             nn.Linear(dim * mlp_ratio, dim),
         )
 
+        # 四个layer norm, 对应三次attention + 一次ffn
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
         self.norm3 = nn.LayerNorm(dim)
@@ -48,11 +53,18 @@ class DecoderLayer(nn.Module):
         m_pos: Optional[Tensor] = None,
     ):
         """
-        tgt: (bs, R, M, dim)
+        tgt: target query states
+        tgt: (bs: batch_size, R:reference_line_num, 32, M:mode_num, 6, dim:hidden_dim, 128)
         tgt_key_padding_mask: (bs, R)
+
+        memory: encoder output
+        memory: (bs: batch_size, L: token_num, dim:hidden_dim, 128)
+        memory_key_padding_mask: (bs, L)
         """
+
         bs, R, M, D = tgt.shape
 
+        # 横向注意力
         tgt = tgt.transpose(1, 2).reshape(bs * M, R, D)
         tgt2 = self.norm1(tgt)
         tgt2 = self.r2r_attn(
@@ -60,6 +72,7 @@ class DecoderLayer(nn.Module):
         )[0]
         tgt = tgt + self.dropout1(tgt2)
 
+        # 纵向注意力
         tgt_tmp = tgt.reshape(bs, M, R, D).transpose(1, 2).reshape(bs * R, M, D)
         tgt_valid_mask = ~tgt_key_padding_mask.reshape(-1)
         tgt_valid = tgt_tmp[tgt_valid_mask]
@@ -71,12 +84,14 @@ class DecoderLayer(nn.Module):
         tgt = torch.zeros_like(tgt_tmp)
         tgt[tgt_valid_mask] = tgt_valid
 
+        # 与encoder的交互
         tgt = tgt.reshape(bs, R, M, D).view(bs, R * M, D)
         tgt2 = self.norm3(tgt)
         tgt2 = self.cross_attn(
             tgt2, memory, memory, key_padding_mask=memory_key_padding_mask
         )[0]
 
+        # ffn
         tgt = tgt + self.dropout2(tgt2)
         tgt2 = self.norm4(tgt)
         tgt2 = self.ffn(tgt2)
@@ -124,6 +139,7 @@ class PlanningDecoder(nn.Module):
         if self.cat_x:
             self.cat_x_proj = nn.Linear(2 * dim, dim)
 
+        # 四个预测头，分别预测位置、偏航角、速度和概率
         self.loc_head = MLPLayer(dim, 2 * dim, self.future_steps * 2)
         self.yaw_head = MLPLayer(dim, 2 * dim, self.future_steps * 2)
         self.vel_head = MLPLayer(dim, 2 * dim, self.future_steps * 2)
@@ -136,34 +152,40 @@ class PlanningDecoder(nn.Module):
         enc_emb = enc_data["enc_emb"]
         enc_key_padding_mask = enc_data["enc_key_padding_mask"]
 
-        r_position = data["reference_line"]["position"]
-        r_vector = data["reference_line"]["vector"]
-        r_orientation = data["reference_line"]["orientation"]
-        r_valid_mask = data["reference_line"]["valid_mask"]
-        r_key_padding_mask = ~r_valid_mask.any(-1)
+        # Step 1: 提取参考线特征
+        r_position = data["reference_line"]["position"] # [B,R, P, 2]，参考线位置采样
+        r_vector = data["reference_line"]["vector"] # [B, R, P, 2]，参考线向量
+        r_orientation = data["reference_line"]["orientation"] # [B, R, P]，参考线方向角
+        r_valid_mask = data["reference_line"]["valid_mask"] # [B, R, P]，参考线有效掩码
+        r_key_padding_mask = ~r_valid_mask.any(-1) # [B, R]，参考线有效掩码掩码
 
+        # Step 2: 将参考线位置、向量和方向角拼接在一起，得到具有6D向量的参考线特征（相对位置，方向，yaw）
         r_feature = torch.cat(
             [
-                r_position - r_position[..., 0:1, :2],
-                r_vector,
+                r_position - r_position[..., 0:1, :2], # 相较于起点的偏移
+                r_vector, # 方向向量
                 torch.stack([r_orientation.cos(), r_orientation.sin()], dim=-1),
             ],
             dim=-1,
         )
 
+        # Step 3: 编码参考线
         bs, R, P, C = r_feature.shape
         r_valid_mask = r_valid_mask.view(bs * R, P)
         r_feature = r_feature.reshape(bs * R, P, C)
-        r_emb = self.r_encoder(r_feature, r_valid_mask).view(bs, R, -1)
+        r_emb = self.r_encoder(r_feature, r_valid_mask).view(bs, R, -1) # [B, R, 128]
 
+        # Step 4: 给参考线，加位置编码
         r_pos = torch.cat([r_position[:, :, 0], r_orientation[:, :, 0, None]], dim=-1)
         r_emb = r_emb + self.r_pos_emb(r_pos)
 
-        r_emb = r_emb.unsqueeze(2).repeat(1, 1, self.num_mode, 1)
-        m_emb = self.m_emb.repeat(bs, R, 1, 1)
+        # Step 5: 构建初始查询Q
+        r_emb = r_emb.unsqueeze(2).repeat(1, 1, self.num_mode, 1) # [B, R, M, 128]
+        m_emb = self.m_emb.repeat(bs, R, 1, 1) # [B, R, M, 128]
 
-        q = self.q_proj(torch.cat([r_emb, m_emb], dim=-1))
+        q = self.q_proj(torch.cat([r_emb, m_emb], dim=-1)) # [B, R, M, 128]
 
+        # Step 6: 通过decoder blocks进行解码
         for blk in self.decoder_blocks:
             q = blk(
                 q,
@@ -174,10 +196,12 @@ class PlanningDecoder(nn.Module):
             )
             assert torch.isfinite(q).all()
 
+        # Step 7: 拼接自车状态
         if self.cat_x:
             x = enc_emb[:, 0].unsqueeze(1).unsqueeze(2).repeat(1, R, self.num_mode, 1)
             q = self.cat_x_proj(torch.cat([q, x], dim=-1))
 
+        # Step 8: 预测输出
         loc = self.loc_head(q).view(bs, R, self.num_mode, self.future_steps, 2)
         yaw = self.yaw_head(q).view(bs, R, self.num_mode, self.future_steps, 2)
         vel = self.vel_head(q).view(bs, R, self.num_mode, self.future_steps, 2)
